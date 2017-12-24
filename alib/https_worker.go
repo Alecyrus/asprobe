@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/pem"
-	"net"
 	"os"
 	"os/signal"
 	"time"
+
+	"github.com/valyala/fasthttp"
 
 	"github.com/garyburd/redigo/redis"
 	"github.com/gocraft/work"
@@ -27,6 +28,10 @@ var redisPool = &redis.Pool{
 type Context struct {
 	customerID int64
 }
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string { return "tls: Connection timed out" }
 
 func StartWorker(conncurrency uint) {
 	// Make a new pool. Arguments:
@@ -79,7 +84,6 @@ func (c *Context) FindCustomer(job *work.Job, next work.NextMiddlewareFunc) erro
 }
 
 func (c *Context) GetCertificatesPEM(job *work.Job) error {
-	// Extract arguments:
 	addr := job.ArgString("address")
 	if err := job.ArgError(); err != nil {
 		return err
@@ -98,9 +102,15 @@ func (c *Context) Export(job *work.Job) error {
 }
 
 func GetCertificatesPEMFrom(address string) (string, error) {
-	log.Print("Start....")
-	timeout := 5
-	conn, err := net.DialTimeout("tcp", address, time.Duration(timeout)*time.Second)
+	timeout := time.Duration(5) * time.Second
+	var errChannel chan error
+	if timeout != 0 {
+		errChannel = make(chan error, 2)
+		time.AfterFunc(timeout, func() {
+			errChannel <- timeoutError{}
+		})
+	}
+	conn, err := fasthttp.Dial(address)
 	if err != nil {
 		log.Error().Err(err).Str("tls", address).Msg("Failed to establish the tcp connection")
 		return "", err
@@ -108,12 +118,16 @@ func GetCertificatesPEMFrom(address string) (string, error) {
 	connn := tls.Client(conn, &tls.Config{
 		InsecureSkipVerify: true,
 	})
-	err = connn.Handshake()
+	go func() {
+		errChannel <- connn.Handshake()
+	}()
+
+	err = <-errChannel
+
 	if err != nil {
 		log.Error().Err(err).Str("tls", address).Msg("Failed to Handshake with tls connection")
 		return "", err
 	}
-	defer connn.Close()
 	var b bytes.Buffer
 	for _, cert := range connn.ConnectionState().PeerCertificates {
 		err := pem.Encode(&b, &pem.Block{
@@ -125,6 +139,7 @@ func GetCertificatesPEMFrom(address string) (string, error) {
 			return "", err
 		}
 	}
+	connn.Close()
 	log.Info().Int("pid", os.Getpid()).Msg("Get Certificates successfully!")
 	return b.String(), nil
 }
